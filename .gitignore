@@ -218,3 +218,27 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Research data, archives, and generated model outputs
+/output/
+/outputs/
+/test/data/
+*.xlsx
+*.xls
+*.zip
+*.rds
+*.RDS
+*.pt
+*.pth
+.DS_Store
+
+# Ignore data by default; include only the four HFC replication sources.
+/data/*
+!/data/MIT AI negotiation competition/
+/data/MIT AI negotiation competition/*
+!/data/MIT AI negotiation competition/outcomes/
+/data/MIT AI negotiation competition/outcomes/*
+!/data/MIT AI negotiation competition/outcomes/round2_hfc_wide_outcomes_deid.xlsx
+!/data/MIT AI negotiation competition/outcomes/unprompted_hfc_wide_outcomes_deid.xlsx
+!/data/MIT AI negotiation competition/outcomes/inject_voss_modified_hfc_wide_outcomes_deid.xlsx
+!/data/MIT AI negotiation competition/outcomes/negomate_modified_hfc_wide_outcomes_deid.xlsx
