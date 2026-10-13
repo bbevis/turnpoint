@@ -1,10 +1,10 @@
-"""Convert the original HFC Excel files into TurnPoint's standard CSV format.
+"""Convert the original HFC or Rental Excel files into TurnPoint's standard CSV format.
 
 Run from the repository root:
     python test/prepare_mit.py "data/MIT AI negotiation competition" data/formatted
-Requires openpyxl. Only *_hfc_wide_outcomes_deid.xlsx files are read: these
-contain both dialogue and outcomes. Non-HFC files and duplicate long-form
-exports are ignored. Use --conditions to select specific HFC conditions.
+Requires openpyxl. Matching wide outcome workbooks are read: these
+contain both dialogue and outcomes. Other exercises and duplicate long-form exports are ignored.
+Use --exercise rental for Rental; --conditions optionally selects conditions.
 """
 
 import argparse
@@ -18,16 +18,16 @@ import re
 from openpyxl import load_workbook
 
 DIMENSIONS = ("instrumental", "self", "process", "relationship")
-ROLE = re.compile(r"^\s*(consultant|coo)\s*:\s*", re.IGNORECASE)
+ROLE = re.compile(r"^\s*(consultant|coo|landlord|tenant)\s*:\s*", re.IGNORECASE)
 PRIVATE = re.compile(r"<negotiation_(preparation|strategy)>.*?</negotiation_\1>", re.DOTALL | re.IGNORECASE)
 
 
-def prepare_mit(source, destination, conditions=None):
-    """Read HFC source workbooks and write turns and linked outcome tables.
+def prepare_mit(source, destination, conditions=None, exercise="hfc"):
+    """Read selected MIT source workbooks and write turns and linked outcome tables.
 
     source is the supplied MIT folder containing outcomes/. Reads all supplied
-    HFC conditions unless conditions names are given. Participant IDs are the
-    source roles (consultant/coo); agent IDs remain metadata. Conversation IDs
+    exercise conditions unless condition names are given. Participant IDs are the
+    source roles (consultant/coo or landlord/tenant); agent IDs remain metadata. Conversation IDs
     combine condition, exercise, and original Excel row, avoiding collisions.
 
     Removes appended SVI questionnaire responses and tagged preparation/strategy
@@ -38,14 +38,14 @@ def prepare_mit(source, destination, conditions=None):
     Source workbooks are streamed and never modified. Output files are replaced.
     """
     source, destination = Path(source), Path(destination)
-    files = sorted((source / "outcomes").glob("*_hfc_wide_outcomes_deid.xlsx"))
-    available = {p.name.removesuffix("_hfc_wide_outcomes_deid.xlsx") for p in files}
+    files = sorted((source / "outcomes").glob(f"*_{exercise}_wide_outcomes_deid.xlsx"))
+    available = {p.name.removesuffix(f"_{exercise}_wide_outcomes_deid.xlsx") for p in files}
     if conditions:
         if set(conditions) - available:
-            raise ValueError(f"HFC conditions not found: {sorted(set(conditions) - available)}")
-        files = [p for p in files if p.name.removesuffix("_hfc_wide_outcomes_deid.xlsx") in conditions]
+            raise ValueError(f"Conditions not found: {sorted(set(conditions) - available)}")
+        files = [p for p in files if p.name.removesuffix(f"_{exercise}_wide_outcomes_deid.xlsx") in conditions]
     if not files:
-        raise FileNotFoundError(f"No HFC wide outcome workbooks in {source / 'outcomes'}")
+        raise FileNotFoundError(f"No matching wide outcome workbooks in {source / 'outcomes'}")
     destination.mkdir(parents=True, exist_ok=True)
     fields = {
         "turns": ["conversation_id", "turn_number", "speaker_id", "text", "agent_id", "condition", "source_file", "source_row"],
@@ -55,6 +55,7 @@ def prepare_mit(source, destination, conditions=None):
     }
     required = {"conversation", "role_1", "role_2", "value_created"} | {
         f"svi_{dimension}_{side}" for dimension in DIMENSIONS for side in (1, 2)}
+    report = []
     with ExitStack() as stack:
         writers = {}
         for name, columns in fields.items():
@@ -63,7 +64,7 @@ def prepare_mit(source, destination, conditions=None):
             writers[name].writeheader()
         for path in files:
             counts = Counter()
-            condition = path.name.removesuffix("_hfc_wide_outcomes_deid.xlsx")
+            condition = path.name.removesuffix(f"_{exercise}_wide_outcomes_deid.xlsx")
             workbook = load_workbook(path, read_only=True, data_only=True)
             try:
                 rows = workbook.active.iter_rows(values_only=True)
@@ -73,7 +74,7 @@ def prepare_mit(source, destination, conditions=None):
                 for source_row, values in enumerate(rows, 2):
                     row = dict(zip(headers, values))
                     roles = [str(row[f"role_{side}"]).strip().lower() for side in (1, 2)]
-                    if set(roles) != {"consultant", "coo"}:
+                    if set(roles) != ({"consultant", "coo"} if exercise == "hfc" else {"landlord", "tenant"}):
                         raise ValueError(f"{path.name}, row {source_row}: unexpected participant roles")
                     reason, cleaned = None, []
                     removed_surveys = removed_private = 0
@@ -116,7 +117,7 @@ def prepare_mit(source, destination, conditions=None):
                         writers["excluded_conversations"].writerow({"source_file": path.name, "source_row": source_row, "reason": reason})
                         counts[reason] += 1
                         continue
-                    conversation_id = f"{condition}:hfc:{source_row}"
+                    conversation_id = f"{condition}:{exercise}:{source_row}"
                     for number, speaker, text in cleaned:
                         side = roles.index(speaker) + 1
                         agent = row.get(f"name_deid_{side}", row.get(f"name_{side}"))
@@ -133,13 +134,17 @@ def prepare_mit(source, destination, conditions=None):
                     counts["private_blocks_removed"] += removed_private
             finally:
                 workbook.close()
+            report.append({"source_file": path.name, **dict(counts)})
             print(f"{path.name}: {dict(counts)}", flush=True)
+    import json
+    (destination / "preparation_summary.json").write_text(json.dumps({"exercise": exercise, "files": report}, indent=2))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
-    parser.add_argument("--conditions", nargs="+", help="HFC condition names; default: all supplied HFC conditions")
+    parser.add_argument("--exercise", choices=["hfc", "rental"], default="hfc", help="MIT exercise (default: hfc)")
+    parser.add_argument("--conditions", nargs="+", help="Condition names; default: all supplied conditions")
     args = parser.parse_args()
-    prepare_mit(args.source, args.destination, args.conditions)
+    prepare_mit(args.source, args.destination, args.conditions, args.exercise)

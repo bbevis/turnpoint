@@ -1,4 +1,4 @@
-"""Joint training of the turn encoder and conversation outcome model."""
+"""Outcome training with frozen MPNet turn embeddings."""
 
 from copy import deepcopy
 from math import isfinite
@@ -7,36 +7,24 @@ from statistics import fmean, pstdev
 import torch
 from torch.nn import functional as F
 
-from .encoder import TurnEncoder, build_vocabulary
+from .encoder import TurnEncoder, MODEL_NAME, MODEL_REVISION
 from .model import ConversationModel
 
 
 def train_model(training, validation, conversation_outcomes=None, individual_outcomes=None, *,
-                epochs=10, learning_rate=0.001, reconstruction_weight=0.1,
-                sparsity_weight=0.001, outcome_weights=None, encoder_options=None,
-                model_options=None, vocabulary_options=None, seed=0, device="cpu",
+                epochs=10, learning_rate=0.001, outcome_weights=None, encoder_options=None,
+                model_options=None, seed=0, device="cpu",
                 checkpoint=None):
-    """Fit both neural components using separate training/validation conversations.
+    """Train the conversation Transformer using frozen cached turn embeddings.
 
-    training, validation: iterables from load_conversations, with disjoint IDs.
-    conversation_outcomes, individual_outcomes: name/type dictionaries matching
-    ConversationModel (continuous, binary, or integer class count).
-    epochs, learning_rate: Adam optimisation settings. One conversation per step.
-    reconstruction_weight, sparsity_weight: nonnegative auxiliary loss weights.
-    outcome_weights: optional scope/name weights, e.g.
-        {'conversation_outcomes': {'score': 2}}; unspecified targets weigh 1.
-    encoder_options, model_options, vocabulary_options: constructor/build options.
-    seed, device: random seed and PyTorch device, default CPU.
-    checkpoint: optional output file for the best weights and preprocessing.
-
-    Returns a dictionary with encoder, model, vocabulary, transforms, history,
-    best_epoch, and best_validation_loss. Returned components are in eval mode.
-    Continuous targets are standardised; binary/multiclass outputs remain logits.
-    Transforms and vocabulary are learned on training data only. Missing targets
-    are skipped; all-missing conversations do not contribute to optimisation.
-    Losses average over turns and observed weighted targets within a conversation,
-    then equally over labelled conversations. Validation outcome loss alone
-    selects the best epoch. Both input iterables are materialised in memory.
+    Splits must contain distinct conversation IDs. Continuous targets are scaled
+    on training data only; missing outcomes are skipped. Loss averages over turns
+    and weighted observed targets, then equally over labelled conversations.
+    Validation outcome loss selects the best epoch after all epochs run.
+    encoder_options accepts cache_dir/encoding_device; model_options configures
+    the conversation Transformer. Only that Transformer and its heads are trained.
+    Checkpoints contain its weights, outcome transforms, encoder configuration,
+    pinned pretrained revision, and training history.
     """
     training, validation = list(training), list(validation)
     for dataset in (training, validation):
@@ -47,8 +35,6 @@ def train_model(training, validation, conversation_outcomes=None, individual_out
         raise ValueError("Training and validation conversation IDs must not overlap")
     if type(epochs) is not int or epochs < 1 or not isfinite(learning_rate) or learning_rate <= 0:
         raise ValueError("epochs and learning_rate must be positive")
-    if any(not isfinite(w) or w < 0 for w in (reconstruction_weight, sparsity_weight)):
-        raise ValueError("Auxiliary loss weights must be finite and nonnegative")
     specifications = {"conversation_outcomes": dict(conversation_outcomes or {}),
                       "individual_outcomes": dict(individual_outcomes or {})}
     outcome_weights = outcome_weights or {}
@@ -113,12 +99,12 @@ def train_model(training, validation, conversation_outcomes=None, individual_out
 
     torch.manual_seed(seed)
     encoder_options, model_options = encoder_options or {}, model_options or {}
-    vocabulary = build_vocabulary((t["text"] for c in training for t in c["turns"]), **(vocabulary_options or {}))
-    encoder = TurnEncoder(vocabulary, **encoder_options).to(device)
-    model = ConversationModel(encoder.sparse_encoder.out_features + 2,
+    encoder = TurnEncoder(**encoder_options).to(device)
+    encoder.prepare(t["text"] for c in training + validation for t in c["turns"])
+    model = ConversationModel(encoder.output_dim,
                               specifications["conversation_outcomes"], specifications["individual_outcomes"],
                               **model_options).to(device)
-    parameters = list(encoder.parameters()) + list(model.parameters())
+    parameters = list(model.parameters())
     optimizer = torch.optim.Adam(parameters, lr=learning_rate)
 
     def loss_for(conversation):
@@ -143,8 +129,7 @@ def train_model(training, validation, conversation_outcomes=None, individual_out
             losses.append(weight * loss)
             total_weight += weight
         outcome_loss = torch.stack(losses).sum() / total_weight
-        total = outcome_loss + reconstruction_weight * encoded["reconstruction_loss"] + sparsity_weight * encoded["sparsity_loss"]
-        return outcome_loss, total
+        return outcome_loss, outcome_loss
 
     history, best, best_loss, best_epoch = [], None, float("inf"), 0
     for epoch in range(1, epochs + 1):
@@ -172,15 +157,30 @@ def train_model(training, validation, conversation_outcomes=None, individual_out
         print(f"Epoch {epoch}/{epochs}: training={history[-1]['training_outcome_loss']:.4f}, validation={validation_loss:.4f}")
         if validation_loss < best_loss:
             best_loss, best_epoch = validation_loss, epoch
-            best = deepcopy({"encoder": encoder.state_dict(), "model": model.state_dict()})
+            best = deepcopy({"model": model.state_dict()})
 
-    encoder.load_state_dict(best["encoder"])
     model.load_state_dict(best["model"])
     if checkpoint is not None:
-        torch.save({**best, "vocabulary": vocabulary, "transforms": transforms,
+        torch.save({**best, "text_model": MODEL_NAME, "text_model_revision": MODEL_REVISION, "transforms": transforms,
                     "specifications": specifications, "encoder_options": encoder_options,
                     "model_options": model_options, "best_epoch": best_epoch,
                     "best_validation_loss": best_loss, "history": history}, checkpoint)
-    return {"encoder": encoder, "model": model, "vocabulary": vocabulary,
+    return {"encoder": encoder, "model": model,
             "transforms": transforms, "history": history,
             "best_epoch": best_epoch, "best_validation_loss": best_loss}
+
+
+def load_model(path, device="cpu"):
+    """Load a frozen-MPNet checkpoint for scoring without retraining.
+
+    Reuses the exact pretrained revision and target transformations. Older GRU
+    checkpoints are incompatible. Load only checkpoints from trusted sources.
+    """
+    saved = torch.load(path, map_location=device, weights_only=True)
+    if saved.get("text_model") != MODEL_NAME or saved.get("text_model_revision") != MODEL_REVISION:
+        raise ValueError("Checkpoint does not use the supported pinned MPNet encoder")
+    encoder = TurnEncoder(**saved["encoder_options"]).to(device)
+    model = ConversationModel(encoder.output_dim, **saved["specifications"], **saved["model_options"]).to(device)
+    model.load_state_dict(saved["model"])
+    encoder.eval(); model.eval()
+    return {"encoder": encoder, "model": model, "transforms": saved["transforms"]}

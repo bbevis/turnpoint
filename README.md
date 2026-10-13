@@ -6,9 +6,9 @@ measured outcomes in a standard format; the package has no fixed outcome names
 or dataset-specific assumptions.
 
 **Current status:** data loading, a turn encoder, and a conversation model with masked self-attention
-and joint training are implemented. Neural components start untrained and can
-now be fitted to user-supplied outcomes. Turn masking and outcome-specific
-importance scores are implemented.
+and outcome training are implemented. A frozen pretrained MPNet encoder represents
+turn text; the conversation Transformer is fitted to user-supplied outcomes. Consecutive prefix prediction updates provide outcome-specific
+turn importance scores.
 
 ## 1. Install in a virtual environment
 
@@ -189,300 +189,181 @@ yielding conversations does not make file reading a streaming operation.
 
 ## 4. Encode turns
 
-`src/turnpoint/encoder.py` uses PyTorch embeddings, a GRU, and a sparse
-autoencoder. It contains no dataset-specific code or named outcome variables.
-
-Build the vocabulary from **training conversations only**, after deciding your
-conversation-level split. Reuse that vocabulary for validation and testing;
-unseen tokens map to an unknown token. For a small runnable demonstration:
+TurnPoint uses the frozen pretrained Sentence Transformer
+[`sentence-transformers/all-mpnet-base-v2`](https://huggingface.co/sentence-transformers/all-mpnet-base-v2),
+pinned to revision `e8c3b32edf5434bc2275fc9bab85f82640a19130`.
+The first use downloads the model from Hugging Face; later uses reuse local files.
+It is an English text encoder; suitability for other languages needs separate assessment.
 
 ```python
-from turnpoint import TurnEncoder, build_vocabulary
+from turnpoint import TurnEncoder, load_conversations
 
-training_turns = [
-    {"speaker_id": "customer", "text": "Can you explain this?"},
-    {"speaker_id": "advisor", "text": "Of course."},
-]
-vocabulary = build_vocabulary((turn["text"] for turn in training_turns), min_count=1)
-encoder = TurnEncoder(vocabulary)
-result = encoder(training_turns)
-print(result["vectors"].shape)  # torch.Size([2, 514])
+conversation = next(load_conversations("/path/to/formatted_data"))
+encoder = TurnEncoder()
+encoded = encoder(conversation["turns"])
+print(encoded["vectors"].shape)  # Number of turns by 770.
 ```
 
-In actual use, pass `conversation["turns"]` from the loader. Lowercase word and
-punctuation tokens receive learned embeddings. Defaults are 100 embedding
-entries, 128 GRU units, and 512 sparse ReLU features. Change them with
-`TurnEncoder(vocabulary, embedding_dim=100, hidden_dim=128, sparse_dim=512)`.
-`build_vocabulary` defaults to at most 20,000 words/punctuation tokens appearing
-at least twice. Its tokenisation is a simple baseline, not a language-specific
-segmenter; languages without whitespace-separated words may need a different
-text preparation choice.
+Each turn is encoded independently, without access to preceding or future turns.
+The 768-dimensional text embedding is concatenated with log(1 + word count) and
+an indicator that the speaker changed since the preceding turn (first turn = 0).
+Turn position and target-speaker information are added by the conversation model.
+Extra input columns are retained by the loader but are not automatically model inputs.
 
-The return dictionary contains:
+Long turns are tokenised without truncation and split into consecutive,
+non-overlapping chunks within MPNet's 384-token limit, including special tokens.
+Chunk embeddings are L2-normalised, averaged with weights proportional to their
+content-token counts, and L2-normalised again. This preserves coverage of the
+whole turn, but does not model relationships across chunks inside the text encoder.
 
-| Key | Contents |
-|---|---|
-| `vectors` | One row per turn: sparse features, log(1 + word count), speaker-change indicator |
-| `semantic_features` | The sparse features alone, without metadata |
-| `reconstruction_loss` | Mean squared error reconstructing the dense GRU vectors |
-| `sparsity_loss` | Mean absolute sparse activation, to be weighted by the trainer |
+Embeddings are cached in `.cache/turnpoint/mpnet.sqlite3`, ignored by Git.
+Cache keys include exact text, pretrained revision, and chunking policy.
+Only text embeddings are cached; speaker metadata is calculated per conversation.
+The cache may contain sensitive information derived from your text; keep it local.
+A frozen encoder fits nothing to these data, so its cache can be shared across
+training, validation, and test splits without fitting on held-out outcomes.
+Use `encoder.prepare(texts)` to compute missing embeddings in batches before training.
+Apple MPS accelerates encoding when available; otherwise it uses CPU.
+For CPU-only encoding, use `TurnEncoder(encoding_device="cpu")`.
 
-The first speaker-change indicator is zero. Later values are one when the
-speaker differs from the previous turn, otherwise zero. This keeps arbitrary
-speaker names out of the numerical features. For dyads, the change sequence
-captures the speaker pattern up to relabelling; for multi-party conversations
-it does not fully represent identity. Original IDs remain in the loaded data
-for assigning individual outcomes. Pass one complete, ordered conversation
-per encoder call; metadata must not span separate conversations.
+## 5. Conversation model
 
-**These vectors are initially untrained.** The training function below combines
-outcome prediction with reconstruction and sparsity losses. Reconstruction alone is not the training objective. No
-outcome information enters the encoder directly. Unit-length decoder columns
-prevent lowering the sparsity penalty merely by rescaling decoder weights.
+The conversation model is a randomly initialised turn-level Transformer using
+PyTorch encoder layers, with a future-turn attention mask. After each turn it
+predicts eventual outcomes using only the current and preceding turns. This is
+outcome prediction, not next-token generation.
 
-The model uses PyTorch's existing [GRU](https://docs.pytorch.org/docs/stable/generated/torch.nn.GRU.html)
-and embedding/linear layers. No separate neural-network implementation is needed.
-
-## 5. Predict outcomes after each turn
-
-`src/turnpoint/model.py` defines `ConversationModel`, using PyTorch's
-[TransformerEncoder](https://docs.pytorch.org/docs/stable/generated/torch.nn.TransformerEncoder.html).
-It is a turn-level Transformer with masked self-attention, built from PyTorch
-encoder layers. Each layer contains multi-head self-attention, a ReLU
-feed-forward network, residual connections, and layer normalisation after each
-residual addition. There is no encoder-decoder cross-attention or pretrained
-checkpoint. It takes turn vectors and original speaker IDs, without outcome
-labels. A future-turn mask restricts each prediction to the current and earlier
-turns, including the turn being evaluated.
-Sinusoidal positions encode order. Defaults are two layers, four attention heads,
-128 hidden dimensions, and 0.1 dropout; all are configurable.
-
-Specify the names and types of the outcomes you want to model:
-
-| Type specification | Output after each turn |
-|---|---|
-| `"continuous"` | One regression score |
-| `"binary"` | One logit; use sigmoid to obtain a probability |
-| An integer >= 2, e.g. `3` | That many class logits; use softmax for probabilities |
-
-For example, using `encoder` and `training_turns` from the previous section:
+Defaults are two layers, hidden width 128, four attention heads, feed-forward
+width 512, ReLU, dropout 0.1, residual connections and post-sublayer layer norms.
+Sinusoidal positions encode turn order. For individual outcomes, shared prediction
+heads use target-versus-other speaker indicators. These indicators distinguish
+whose outcome is predicted, without learning embeddings for named individuals.
+In multi-party conversations, other participants are pooled in this indicator.
 
 ```python
-import torch
 from turnpoint import ConversationModel
 
 model = ConversationModel(
-    input_dim=514,  # Default encoder: 512 sparse features + 2 metadata entries.
-    conversation_outcomes={"resolved": "binary", "joint_score": "continuous"},
-    individual_outcomes={"satisfaction": "continuous", "learning": "continuous"},
+    input_dim=encoder.output_dim,
+    conversation_outcomes={"value_created": "continuous"},
+    individual_outcomes={"relationship": "continuous"},
 )
-encoder.eval()
-model.eval()
-with torch.no_grad():
-    encoded = encoder(training_turns)
-    predictions = model(encoded["vectors"], [t["speaker_id"] for t in training_turns])
-
-print(predictions["conversation_outcomes"]["joint_score"].shape)  # [2, 1]
-print(predictions["individual_outcomes"]["customer"]["satisfaction"].shape)  # [2, 1]
-probability_resolved = predictions["conversation_outcomes"]["resolved"].sigmoid()
 ```
 
-Each row predicts the same eventual outcome after another turn has been observed.
-Outputs are tensors, so gradients can flow through the model into the encoder
-during joint training. If you change the encoder's `sparse_dim`, set `input_dim`
-to that dimension plus two. Hidden dimensions must be divisible by attention heads.
+Outcome definitions accept `"continuous"`, `"binary"`, or an integer class count.
+Outputs are a prediction after every turn, grouped by outcome and participant.
+Binary and multiclass outputs are logits until converted to probabilities.
 
-For individual outcomes, the model conditions a shared prediction layer on which
-turns were spoken by the participant being evaluated. Thus a customer's evaluation
-and an advisor's evaluation receive distinct predictions without assigning numeric
-meaning to their names. Renaming arbitrary participant IDs simply renames the
-corresponding output keys. Conversation-level predictions use a separate shared
-stream. In multi-party data, target indicators group all non-target speakers
-together; they do not fully distinguish every other participant's identity.
-
-**The outputs are not meaningful predictions until training.** The training
-function below fits both neural components against observed outcomes, skipping
-missing targets and combining outcome, reconstruction, and sparsity losses.
-This model predicts outcomes; use `score_turns` below to compute turn importance.
-
-## 6. Train on your outcomes
-
-`src/turnpoint/train.py` provides `train_model`. Prepare separate training and
-validation folders in the standard format, then select your outcome names and
-types. Split **whole conversations**, not turns from the same conversation.
-Decisions about shared participants, agents, or other dependencies belong to your
-dataset preparation script. Keep a separate test split untouched for final
-assessment; this function does not evaluate it.
+## 6. Train and save a model
 
 ```python
 from turnpoint import load_conversations, train_model
 
+training = list(load_conversations("/path/to/training_data"))
+validation = list(load_conversations("/path/to/validation_data"))
 fitted = train_model(
-    training=load_conversations("/path/to/training_data"),
-    validation=load_conversations("/path/to/validation_data"),
-    conversation_outcomes={"resolved": "binary", "joint_score": "continuous"},
-    individual_outcomes={"satisfaction": "continuous", "learning": "continuous"},
-    epochs=10,
-    checkpoint="/path/to/existing/output_folder/best_model.pt",
+    training, validation,
+    conversation_outcomes={"value_created": "continuous"},
+    individual_outcomes={"relationship": "continuous"},
+    checkpoint="model.pt",
 )
-print(fitted["best_epoch"])
-print(fitted["best_validation_loss"])
 ```
 
-Replace all paths and outcome names with your own. You can supply conversation
-outcomes, individual outcomes, or both. Each selected outcome needs observed
-training values. For an outcome with three classes, specify `"outcome_name": 3`;
-all three labels must be represented in training. Validation labels must belong
-to the training categories. Binary numeric 0/1 targets preserve their meaning;
-other binary labels must have two training categories. Their ordering is stored
-in `fitted["transforms"]`.
+Supply separate conversations in the two splits. Text embeddings stay frozen;
+only the conversation Transformer and outcome heads receive gradient updates.
+The training objective compares every prefix prediction with the same observed
+final outcome. Loss is averaged over turns and observed weighted targets within
+each conversation; labelled conversations have equal weight. Continuous targets
+are standardised using training-only means and population standard deviations.
+Binary targets use binary cross-entropy; multiclass targets use cross-entropy.
+Missing outcomes are skipped. There are no reconstruction or sparsity penalties.
 
-The function:
+Defaults are ten epochs, Adam learning rate 0.001, gradient clipping at norm 1,
+seed 0, and CPU conversation-model training. Validation outcome loss selects the
+best epoch after all ten epochs run. Test data must not select epochs.
+Optional Python arguments include `epochs`, `learning_rate`, `outcome_weights`,
+`encoder_options`, `model_options`, `seed`, and `device`; the command-line runner
+keeps these settings internal. For example, `encoder_options={"encoding_device": "cpu"}`.
 
-- Builds the vocabulary from training text only.
-- Standardises each continuous outcome using its training mean and population
-  standard deviation (scale 1 for a constant target). Individual-outcome scales
-  are pooled across participants, not fitted separately for arbitrary IDs.
-- Learns binary/category label mappings from training targets only.
-- Predicts each final outcome after every observed turn, supervising each prefix
-  with the same final target.
-- Skips missing targets and conversations with no positively weighted observed
-  target. Each split must contain at least one labelled conversation.
-- Trains both components jointly using Adam, with gradient norm clipping at 1.
-- Restores the encoder and model from the epoch with the lowest validation
-  **outcome loss**, excluding reconstruction and sparsity penalties.
-
-Training uses one conversation per optimiser step. Each target loss averages
-across turns, then observed target losses are averaged within each conversation.
-Each observed participant/outcome pair is a target; missing targets are omitted
-from that average. Epoch losses average equally across labelled conversations.
-Longer conversations therefore receive no extra weight merely for having more
-turns. Both splits are materialised in memory; this is an initial single-
-conversation training implementation, not a batched training system.
-
-### Training settings
-
-| Argument | Default | Meaning |
-|---|---|---|
-| `epochs` | 10 | Number of training passes |
-| `learning_rate` | 0.001 | Adam learning rate |
-| `reconstruction_weight` | 0.1 | Weight of sparse-autoencoder reconstruction loss |
-| `sparsity_weight` | 0.001 | Weight of mean absolute sparse activation |
-| `seed` | 0 | PyTorch random seed |
-| `device` | `"cpu"` | PyTorch device for both neural components |
-| `checkpoint` | `None` | Optional file to save the best weights and preprocessing |
-
-Pass constructor settings through `encoder_options`, `model_options`, and
-`vocabulary_options`. For example, `encoder_options={"sparse_dim": 256}` or
-`model_options={"hidden_dim": 64, "num_heads": 4}`. The training function connects
-the encoder's output width to the model automatically.
-
-All outcomes default to weight 1. To change their relative contributions, pass
-`outcome_weights={"conversation_outcomes": {"joint_score": 2.0}}`. The weighted
-average is normalised by the sum of weights of observed targets in each
-conversation. Unspecified weights remain 1; weights must be nonnegative.
-
-### Returned models and saved checkpoints
-
-The returned dictionary contains `encoder`, `model`, `vocabulary`, `transforms`,
-`history`, `best_epoch`, and `best_validation_loss`. History records training
-and validation outcome losses for each epoch. The returned neural components
-are already in evaluation mode.
-
-Use the trained components as in section 5, replacing `encoder` and `model` with
-`fitted["encoder"]` and `fitted["model"]`. Continuous outputs are in standardised
-units. Recover original units with `prediction * scale + mean`, using
-`fitted["transforms"][scope][outcome_name]`, where scope is
-`"conversation_outcomes"` or `"individual_outcomes"`. Binary/multiclass outputs
-remain logits; sigmoid/softmax gives probabilities. Class probabilities follow
-the order in the stored `classes` list.
-
-When `checkpoint` is supplied, its parent directory must already exist. The
-file stores both state dictionaries, vocabulary, outcome transforms and types,
-constructor options, best epoch, validation loss, and history. For example:
+The returned dictionary contains `encoder`, `model`, `transforms`, `history`,
+`best_epoch`, and `best_validation_loss`. Checkpoints store conversation-model
+weights, outcome definitions/transforms, encoder configuration, the pinned MPNet
+identity/revision, and training history. Frozen pretrained weights are downloaded
+separately and reused locally; they are not duplicated in each checkpoint.
 
 ```python
 import torch
 from turnpoint import TurnEncoder, ConversationModel
+from turnpoint.encoder import MODEL_NAME, MODEL_REVISION
 
-saved = torch.load("/path/to/best_model.pt", map_location="cpu", weights_only=True)
-encoder = TurnEncoder(saved["vocabulary"], **saved["encoder_options"])
-model = ConversationModel(
-    encoder.sparse_encoder.out_features + 2,
-    **saved["specifications"], **saved["model_options"],
-)
-encoder.load_state_dict(saved["encoder"])
+saved = torch.load("model.pt", map_location="cpu", weights_only=True)
+assert saved["text_model"] == MODEL_NAME
+assert saved["text_model_revision"] == MODEL_REVISION
+encoder = TurnEncoder(**saved["encoder_options"])
+model = ConversationModel(encoder.output_dim, **saved["specifications"], **saved["model_options"])
 model.load_state_dict(saved["model"])
 encoder.eval()
 model.eval()
+fitted = {"encoder": encoder, "model": model, "transforms": saved["transforms"]}
 ```
 
-Checkpoints support prediction; they do not contain optimiser state for resuming
-an interrupted run. Validation loss is a model-selection measure, not evidence
-of predictive quality by itself. Assess predictions on held-out conversations
-and against simpler baselines before interpreting turn importance.
+Earlier GRU checkpoints are incompatible with this architecture. Retain them only
+as historical results; train a new model for the MPNet workflow.
 
-## 7. Score each turn by masking its content
+## 7. Score turns using prediction updates
 
-After training, construct a reference mask from **training conversations only**,
-using the fitted encoder. The mask is the mean semantic representation across
-training turns. Reuse it when scoring validation or held-out test conversations.
+After training, predict the final outcome after each turn using only the dialogue
+observed so far. A turn's signed update is its prediction minus the prediction
+at the preceding turn. Its importance is the absolute size of that update divided by the outcome’s
+training-set standard deviation (for continuous outcomes).
 
 ```python
-from turnpoint import fit_mask, score_turns
+from turnpoint import score_turns
 
 # fitted is the dictionary returned by train_model in section 6.
-# Reload training conversations to construct the reference mask.
-mask = fit_mask(load_conversations("/path/to/training_data"), fitted["encoder"])
 conversation = next(load_conversations("/path/to/test_data"))
-importance = score_turns(conversation, fitted, mask)
-
-print(importance["scores"].head())
-importance["scores"].to_csv("turn_scores.csv", index=False)
-importance["trajectories"].to_csv("turn_trajectories.csv", index=False)
+scores = score_turns(conversation, fitted)
+print(scores.head())
+scores.to_csv("turn_scores.csv", index=False)
 ```
 
-Each turn is masked separately by replacing its semantic features with the
-reference vector. Its word count, speaker information, and sequence position
-remain. Every later turn retains its observed content. No outcome labels are
-needed for scoring.
-
-The difference is **original prediction minus masked prediction**:
-
-| Score | Meaning |
+| Column | Meaning |
 | --- | --- |
-| `immediate` | Signed difference directly after the masked turn |
-| `dynamic` | Mean absolute difference from that turn through the conversation end |
-| `final` | Signed difference at the end of the conversation |
+| `prediction` | Predicted final outcome after the current turn |
+| `previous_prediction` | Prediction after the preceding observed turn |
+| `prediction_change` | Current minus previous prediction; signed update |
+| `importance` | Absolute change in training-set standard deviation units for continuous outcomes; probability change for classification |
+| `importance_original` | Absolute change in original outcome units |
+| `standardized_prediction_change` | Signed change divided by the training-set standard deviation for continuous outcomes; signed probability change for classification |
+| `importance_units` | `training_standard_deviation` or `probability` |
 
-`dynamic` is the primary magnitude score. Averaging prevents earlier turns from
-scoring higher merely because more turns follow them. Scores remain separate
-for each outcome and participant; they are not normalised to sum to one.
+The first turn has a prediction but blank previous prediction, change, and
+importance: there is no preceding prefix to compare. Gaps in recorded turn
+numbers do not change this rule; comparison uses the preceding observed turn.
 
-Both tables identify the conversation, focal `turn_number`, focal `speaker_id`,
-outcome `scope`, `outcome`, and outcome owner `participant_id`. A conversation
-outcome has an empty participant ID. Thus, filtering for one focal speaker and
-another participant selects that speaker's turns scored against the other's
-outcomes. `trajectories` also contains `prediction_turn_number`, `original`,
-`masked`, and `difference`, showing how the change develops at each later turn.
+Rows identify `conversation_id`, `turn_number`, `speaker_id`, outcome `scope`,
+`outcome`, `participant_id`, and `class_label`. Conversation outcomes have an
+empty participant ID. To examine A's turns against B's evaluations, select A as
+`speaker_id` and B as `participant_id`.
 
-Continuous differences use the original outcome units. Binary differences use
-probabilities of the second training class; `class_label` identifies it.
-Multiclass outcomes have one row per class, using probability differences.
-A positive signed score means the original content increased that prediction
-relative to the reference mask.
+Continuous predictions and `prediction_change` use original outcome units.
+`importance` uses the standard deviation fitted on training outcomes, so 0.1
+means a change of one tenth of a training-set standard deviation. It is not
+bounded to 0–1. `importance_original` retains the original-unit magnitude.
+For a constant training outcome, the training transform uses a scale of 1.
+Classification importance remains an absolute probability change. Binary outputs
+use the probability of the second training class; multiclass outputs have a row
+per class. Positive changes mean a higher predicted value or class probability.
+Scores remain separate for each outcome and are not normalised to sum to one.
 
-Save the mask alongside your model with `torch.save(mask, "mask.pt")` and load
-with `torch.load("mask.pt", weights_only=True)`. Recompute it after refitting
-model weights. The mask is not automatically included in the training checkpoint.
-
-The training mean provides a reference, but is not guaranteed to be neutral or
-represent a naturally occurring turn. Check whether rankings survive alternative
-training-derived masks and refitted models. Interpret scores only after assessing
-held-out predictive performance. These are changes in model predictions, not
-estimates of what participants would actually have done with different dialogue.
-Scoring requires one original pass plus one pass per turn; complete trajectories
-produce quadratic numbers of rows, so start with short conversations.
+Scoring requires one model pass, with no altered dialogue or reference vector.
+Attention combines preceding dialogue; attention weights are not these scores.
+Large updates identify turns that revise the model's expectation, which may
+reveal an outcome rather than produce it. Small updates can occur when a turn
+was already anticipated. These scores are predictive updates, not causal effects
+or direct measurements of participants' changing feelings. Check prefix
+prediction quality and score stability across fitted models before interpreting
+rankings. Final-turn predictive performance alone does not validate these scores.
 
 ## Troubleshooting
 
@@ -497,8 +378,9 @@ produce quadratic numbers of rows, so start with short conversations.
 
 ## Our HFC example — separate from the package
 
-`test/prepare_mit.py` converts the supplied AI-generated **HFC negotiations only**
-into TurnPoint's standard files. All MIT-specific processing stays in this script.
+`test/prepare_mit.py` converts the supplied AI-generated **HFC or Rental negotiations**
+into TurnPoint's standard files. HFC is the default; `--exercise rental` selects Rental.
+All MIT-specific processing stays in this script.
 
 The four HFC source workbooks are included under
 `data/MIT AI negotiation competition/outcomes/`. No separate data download is
@@ -628,7 +510,7 @@ then divides that reserve equally between validation and testing. Integer
 rounding can slightly change proportions for other sample sizes. At least ten
 conversations are required.
 
-Vocabulary, outcome scaling, baselines, and the reference mask use training
+Outcome scaling and baselines use training
 conversations only. Training updates the model weights; validation selects the
 best epoch; testing evaluates the selected model. All ten epochs run before the
 best epoch is restored. Test conversations never select epochs or fit
@@ -649,10 +531,9 @@ All outputs are in the chosen results folder, without separate fold folders:
 | `model.pt`, `history.csv` | Best weights/preprocessing and per-epoch training/validation losses |
 | `training_summary.json` | Selected epoch, validation loss, and training time |
 | `predictions.csv`, `metrics.csv` | Test predictions and baseline comparisons |
-| `mask.pt`, `scores.csv`, `trajectories.csv` | Training-derived mask and turn importance for up to ten test conversations |
+| `scores.csv` | Prefix predictions, signed updates, and absolute turn importance for every test conversation |
 
-The first up to ten test conversations in deterministic split order receive turn
-scores; they are not a representative sample by design. Individual scores
+Every test conversation receives turn scores. Individual scores
 include own- and counterpart-outcome changes; select different `speaker_id` and
 `participant_id` values for counterpart outcomes. Input tables are loaded into
 memory even when selecting a smaller sample.
@@ -661,13 +542,13 @@ Use `--sample-size 30 --output output/hfc_split_check` with the HFC command for
 a small real-data execution check. Keep outputs under `output/` or `outputs/`
 so Git ignores them. Use a new folder for each run; nonempty output folders are
 rejected. Model and training settings are internal rather than command-line
-options. See `python run.py --help` for the five user inputs.
+options. See `python run.py --help` for the user inputs.
 
-Architecture defaults remain 100-dimensional embeddings, 128 GRU units, 512
-sparse features, and a Transformer with 2 layers, width 128, 4 attention heads,
-and dropout 0.1. Vocabulary maximum is 20,000 tokens with minimum count 2.
-Gradient norm is clipped at 1. Reconstruction and sparsity weights are 0.1 and
-0.001. These are starting settings, not tuned settings.
+Architecture defaults are frozen 768-dimensional MPNet embeddings plus two
+metadata values, and a trainable Transformer with two layers, width 128, four
+attention heads, and dropout 0.1. Gradient norm is clipped at 1. The exact MPNet
+revision is saved in configuration.json and model.pt. Cached embeddings and model
+downloads stay local and are not uploaded to GitHub.
 
 Earlier cross-validation checks are historical outputs from the previous runner.
 They are retained with their original configurations and are not results from
@@ -676,3 +557,88 @@ this single-split protocol.
 Pinned dependencies were recorded on macOS with Python 3.13. Seeds and
 PyTorch deterministic operations support repeat runs in the same environment;
 exact results across platforms, library versions, or devices are not guaranteed.
+
+Outputs from earlier turn-replacement scoring are obsolete and must not be interpreted
+as prefix-update scores. Use a new output folder when running the current workflow.
+
+## Full scoring and preliminary summaries
+
+To score an existing MPNet model without retraining, supply its checkpoint and
+the original formatted data. The runner verifies input file checksums and uses
+only the saved test split. Choose a new output folder.
+
+```bash
+python run.py --data data/formatted --checkpoint output/hfc_mpnet/model.pt --output output/hfc_scored
+```
+
+Both normal training runs and checkpoint scoring now save:
+
+| File | Contents |
+| --- | --- |
+| `scores.csv` | Every test turn's predictions, signed updates and absolute importance |
+| `importance_summary.csv` | Counts, mean, sample SD, median, quartiles, range, positive/negative/zero updates, and candidate thresholds per outcome/relation/class |
+| `candidates.csv` | Candidate turn–outcome flags for shared and counterpart outcomes, without dialogue text |
+| `scoring_summary.json` | Overall coverage, unique flagged turns versus turn–outcome flags, and selection rule |
+| `scoring_configuration.json` | Checkpoint-only scoring provenance, including checkpoint checksum |
+
+Individual summaries separate own-outcome and counterpart-outcome updates. Primary
+candidate exports use counterpart and conversation outcomes. A candidate must have
+positive importance at or above the empirical 95th percentile within its outcome,
+target-relation, and class group. Ties are retained, so the flagged proportion need
+not be exactly 5%; constant zero updates produce no candidates. This is an exploratory
+screening rule, not a statistical significance test or proof of a turning point.
+First-turn scores are undefined and excluded from descriptive statistics. In multi-party
+data there may be multiple counterpart records per focal turn. One turn can be flagged
+for multiple outcomes, so unique turn counts and flag counts are reported separately.
+The previous ten-conversation exports remain historical partial analyses.
+
+## Additional real-data examples
+
+Dataset-specific preparation remains under `test/`; the package contains no
+exercise names, outcome names, or rating mappings.
+
+### MIT Rental
+
+Place the four `*_rental_wide_outcomes_deid.xlsx` workbooks in the same source
+outcomes folder as HFC. Rental files remain ignored by Git under the existing
+HFC-only source allowlist; they are local inputs, not automatically published.
+
+```bash
+python test/prepare_mit.py "data/MIT AI negotiation competition" data/rental_formatted --exercise rental
+python run.py --data data/rental_formatted --conversation-outcomes value_created --individual-outcomes instrumental self process relationship --output output/rental_full
+```
+
+The supplied Rental sources yield 40,601 conversations and 816,736 turns; 194
+conversations are excluded for unidentified speakers. The same dialogue cleaning
+rules as HFC remove appended questionnaires and private preparation/strategy tags.
+The fixed split is 32,480 training, 4,060 validation and 4,061 test conversations.
+
+### CaSiNo human negotiations
+
+Source: Chawla et al. (2021), [CaSiNo](https://github.com/kushalchawla/CaSiNo),
+[paper](https://aclanthology.org/2021.naacl-main.254/), CC BY 4.0.
+The converter downloads the original JSON if missing, using pinned revision
+`2f6ed4a6a55110152a7699fbaa8150d6036314be` and verifying its SHA-256.
+
+```bash
+python test/prepare_casino.py data/casino_raw/casino.json data/casino_formatted
+python run.py --data data/casino_formatted --conversation-outcomes joint_points --individual-outcomes points_scored satisfaction opponent_likeness --output output/casino_full
+```
+
+All 1,030 conversations are retained, with 11,919 human text turns after removing
+2,378 interface events (`Submit-Deal`, `Accept-Deal`, `Reject-Deal`, `Walk-Away`).
+Natural-language offers and acceptance remain. Ratings are explicitly mapped from
+extremely negative (1), slightly negative (2), undecided (3), slightly positive (4),
+to extremely positive (5); mappings are saved in `preparation_summary.json`.
+These ordered ratings are treated as continuous outcomes in this example.
+`joint_points` is the sum of supplied participant points, not incremental surplus
+above a disagreement baseline. Preferences, demographics, deal event metadata and
+strategy annotations are not model inputs. The split is 824/103/103 conversations.
+
+The three datasets are trained and evaluated separately. This demonstrates reuse
+across datasets; it is not a test of an HFC-trained model transferring to human data.
+Raw downloads, formatted data, cached embeddings, and model outputs remain local.
+
+After the example runs finish, `python test/summarise_examples.py` collates
+coverage, primary importance statistics, and model/baseline metrics under
+`output/proposal_results/`. Missing runs are explicitly marked pending.

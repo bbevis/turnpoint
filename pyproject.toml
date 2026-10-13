@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Outcome-grounded analysis of dyadic conversational turns"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["pandas>=2.2", "torch>=2.2"]
+dependencies = ["pandas>=2.2", "torch>=2.2", "sentence-transformers>=6.1,<7"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -18,7 +18,9 @@ from sklearn.metrics import accuracy_score, log_loss, mean_absolute_error, mean_
 from sklearn.model_selection import train_test_split
 import torch
 
-from turnpoint import fit_mask, load_conversations, score_turns, train_model
+from turnpoint import load_conversations, score_turns, train_model, load_model
+from turnpoint.importance import summarise_scores
+from turnpoint.encoder import MODEL_NAME, MODEL_REVISION
 
 def json_object(value):
     """Parse a command-line JSON dictionary, with a readable argument error."""
@@ -65,13 +67,16 @@ def metrics(predictions):
 def run(args):
     """Train one model on 80%, select its epoch on 10%, and test on 10%.
 
-    Whole conversations stay together. Vocabulary, scaling, baselines, and masks
+    Whole conversations stay together. Outcome scaling and baselines
     use training data only. Test data never selects epochs. Input tables are
     loaded into memory; model/training settings are internal defaults.
     """
+    if args.checkpoint:
+        score_checkpoint(args)
+        return
     if not (args.conversation_outcomes or args.individual_outcomes):
         raise ValueError("Specify conversation-outcomes and/or individual-outcomes")
-    if args.sample_size < 0 or args.epochs < 1 or args.score_limit < 0:
+    if args.sample_size < 0 or args.epochs < 1:
         raise ValueError("Use nonnegative sample/score sizes and positive epochs")
     if args.output.exists() and any(args.output.iterdir()):
         raise ValueError("Choose a new output directory to avoid mixing different runs")
@@ -91,7 +96,7 @@ def run(args):
     validation, test = train_test_split(heldout, test_size=0.5, random_state=args.seed)
     print(f"Using {len(selected):,} of {total_conversations:,} conversations: "
           f"{len(training):,} training, {len(validation):,} validation, {len(test):,} test; "
-          f"{args.epochs} epochs; turn scores for up to {args.score_limit} test conversations.", flush=True)
+          f"{args.epochs} epochs; scoring all test conversations.", flush=True)
     assignments = [{"role": role, "conversation_id": selected[i]["conversation_id"]}
                    for role, members in [("training", training), ("validation", validation), ("test", test)]
                    for i in members]
@@ -106,13 +111,16 @@ def run(args):
             for block in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(block)
         hashes[name] = digest.hexdigest()
-    encoder_options = {"embedding_dim": 100, "hidden_dim": 128, "sparse_dim": 512, **args.encoder_options}
+    encoder_options = dict(args.encoder_options)
     model_options = {"hidden_dim": 128, "num_layers": 2, "num_heads": 4, "dropout": 0.1, **args.model_options}
-    vocabulary_options = {"min_count": 2, "max_words": 20000, **args.vocabulary_options}
     configuration = {**vars(args), "selected_conversations": len(selected), "input_sha256": hashes,
         "split_fractions": {"training": 0.8, "validation": 0.1, "test": 0.1},
         "split_counts": {"training": len(training), "validation": len(validation), "test": len(test)},
-        "encoder_options": encoder_options, "model_options": model_options, "vocabulary_options": vocabulary_options,
+        "encoder_options": encoder_options, "model_options": model_options,
+        "text_model": MODEL_NAME, "text_model_revision": MODEL_REVISION,
+        "scoring_method": "consecutive_prefix_prediction_change",
+        "importance_scaling": "training_standard_deviation_for_continuous",
+        "chunking": "nonoverlapping token chunks; token-weighted normalised mean",
         "python": platform.python_version(), "platform": platform.platform(),
         "packages": {d.metadata["Name"]: d.version for d in distributions()}}
     (args.output / "configuration.json").write_text(json.dumps(configuration, indent=2, default=str), encoding="utf-8")
@@ -120,18 +128,14 @@ def run(args):
     predictions = []
     fitted = train_model([selected[i] for i in training], [selected[i] for i in validation],
         args.conversation_outcomes, args.individual_outcomes, epochs=args.epochs, seed=args.seed,
-        learning_rate=args.learning_rate, reconstruction_weight=args.reconstruction_weight,
-        sparsity_weight=args.sparsity_weight, outcome_weights=args.outcome_weights, device=args.device,
-        encoder_options=encoder_options, model_options=model_options, vocabulary_options=vocabulary_options,
+        learning_rate=args.learning_rate, outcome_weights=args.outcome_weights, device=args.device,
+        encoder_options=encoder_options, model_options=model_options,
         checkpoint=args.output / "model.pt")
     pd.DataFrame(fitted["history"]).to_csv(args.output / "history.csv", index=False)
     summary = {"best_epoch": fitted["best_epoch"], "best_validation_loss": fitted["best_validation_loss"],
                "training_seconds": time.monotonic() - started}
     (args.output / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Training finished in {summary['training_seconds'] / 60:.1f} minutes; selected epoch {summary['best_epoch']}.", flush=True)
-    mask = fit_mask((selected[i] for i in training), fitted["encoder"]) if args.score_limit else None
-    if mask is not None:
-        torch.save(mask, args.output / "mask.pt")
     baselines = {}
     for scope, transforms in fitted["transforms"].items():
         for name, transform in transforms.items():
@@ -144,6 +148,7 @@ def run(args):
                     if target.get(name) is not None:
                         counts[transform["classes"].index(target[name])] += 1
             baselines[(scope, name)] = (counts / counts.sum()).tolist()
+    fitted["encoder"].prepare(t["text"] for index in test for t in selected[index]["turns"])
     with torch.no_grad():
         for position, index in enumerate(test):
             conversation = selected[index]
@@ -178,14 +183,61 @@ def run(args):
                                 classes=json.dumps(classes), probabilities=json.dumps(probabilities),
                                 baseline_probabilities=json.dumps(baseline))
                         predictions.append(row)
-            if position < args.score_limit:
-                importance = score_turns(conversation, fitted, mask)
-                for name, table in importance.items():
-                    table.to_csv(args.output / f"{name}.csv", mode="a", header=position == 0, index=False)
+            scores = score_turns(conversation, fitted)
+            scores.to_csv(args.output / "scores.csv", mode="a", header=position == 0, index=False)
     table = pd.DataFrame(predictions)
     table.to_csv(args.output / "predictions.csv", index=False)
     metrics(table).to_csv(args.output / "metrics.csv", index=False)
-    print(f"Completed training and test evaluation. Results: {args.output}", flush=True)
+    save_score_summary(args.output)
+    print(f"Completed training, evaluation and full test scoring. Results: {args.output}", flush=True)
+
+
+def save_score_summary(output):
+    """Write descriptive statistics and candidate flags, without dialogue text."""
+    scores = pd.read_csv(output / "scores.csv", dtype={"conversation_id": str, "speaker_id": str, "participant_id": str})
+    summary, candidates, coverage = summarise_scores(scores)
+    summary.to_csv(output / "importance_summary.csv", index=False)
+    candidates.to_csv(output / "candidates.csv", index=False)
+    (output / "scoring_summary.json").write_text(json.dumps(coverage, indent=2))
+
+
+def score_checkpoint(args):
+    """Score every saved test conversation from an existing run, without fitting."""
+    if args.output.exists() and any(args.output.iterdir()):
+        raise ValueError("Choose a new output directory")
+    if args.sample_size:
+        raise ValueError("Checkpoint scoring uses the saved test split; omit sample-size")
+    source = args.checkpoint.parent
+    configuration = json.loads((source / "configuration.json").read_text())
+    for name, expected in configuration["input_sha256"].items():
+        digest = hashlib.sha256()
+        with (args.data / name).open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected:
+            raise ValueError(f"Input differs from trained dataset: {name}")
+    splits = pd.read_csv(source / "splits.csv", dtype={"conversation_id": str})
+    test_ids = splits.loc[splits.role.eq("test"), "conversation_id"].tolist()
+    wanted = set(test_ids)
+    selected = {c["conversation_id"]: c for c in load_conversations(args.data) if c["conversation_id"] in wanted}
+    if wanted != set(selected):
+        raise ValueError("Some saved test conversations are missing")
+    torch.set_num_threads(1)
+    torch.use_deterministic_algorithms(True)
+    fitted = load_model(args.checkpoint)
+    args.output.mkdir(parents=True)
+    provenance = {"checkpoint": str(args.checkpoint.resolve()),
+                  "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
+                  "input_sha256": configuration["input_sha256"], "scoring_method": "consecutive_prefix_prediction_change",
+        "importance_scaling": "training_standard_deviation_for_continuous",
+                  "test_conversations": len(test_ids)}
+    (args.output / "scoring_configuration.json").write_text(json.dumps(provenance, indent=2))
+    for i, identity in enumerate(test_ids):
+        score_turns(selected[identity], fitted).to_csv(args.output / "scores.csv", mode="a", header=i == 0, index=False)
+        if (i+1) % 500 == 0:
+            print(f"Scored {i+1:,}/{len(test_ids):,} test conversations", flush=True)
+    save_score_summary(args.output)
+    print(f"Completed checkpoint scoring: {len(test_ids):,} conversations; {args.output}", flush=True)
 
 
 def outcome_definitions(names):
@@ -214,11 +266,11 @@ if __name__ == "__main__":
     parser.add_argument("--individual-outcomes", nargs="+", default=[], metavar="NAME", help="Individual outcome names (continuous by default)")
     parser.add_argument("--sample-size", type=int, default=0, help="Optional conversation limit (default: all; 0: all)")
     parser.add_argument("--output", type=Path, default=Path("output/run"), help="Results folder (default: output/run; must be new or empty)")
+    parser.add_argument("--checkpoint", type=Path, help="Existing model.pt: score its saved test split without training")
     # Internal settings, not command-line options.
     parser.set_defaults(
-        epochs=10, seed=0, score_limit=10, encoder_options={}, model_options={}, vocabulary_options={},
-        outcome_weights={}, learning_rate=0.001, reconstruction_weight=0.1,
-        sparsity_weight=0.001, device="cpu",
+        epochs=10, seed=0, encoder_options={}, model_options={},
+        outcome_weights={}, learning_rate=0.001, device="cpu",
     )
     args = parser.parse_args()
     try:
@@ -226,6 +278,6 @@ if __name__ == "__main__":
         args.individual_outcomes = outcome_definitions(args.individual_outcomes)
     except argparse.ArgumentTypeError as error:
         parser.error(str(error))
-    if not (args.conversation_outcomes or args.individual_outcomes):
+    if not args.checkpoint and not (args.conversation_outcomes or args.individual_outcomes):
         parser.error("Specify at least one conversation or individual outcome")
     run(args)

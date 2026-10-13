@@ -16,7 +16,7 @@ class ConversationModel(nn.Module):
     Parameters
     ----------
     input_dim : int
-        Encoder vector width (sparse_dim + 2; 514 with the default encoder).
+        Encoder vector width (768 text dimensions + 2 metadata values = 770).
     conversation_outcomes, individual_outcomes : dict, optional
         Outcome names mapped to 'continuous', 'binary', or an integer class
         count >= 2. For example, {'satisfaction': 'continuous', 'choice': 3}.
