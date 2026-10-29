@@ -1,7 +1,8 @@
 """Train and evaluate TurnPoint with one 80/10/10 conversation split.
 
 Example: python run.py --data data/formatted --conversation-outcomes value_created
-Supply outcome names; continuous is the default. All model settings have defaults.
+Supply outcome names; continuous is the default. With no arguments, use the
+editable settings below. Training settings below apply to both execution routes.
 """
 
 import argparse
@@ -10,6 +11,8 @@ from importlib.metadata import distributions
 import json
 from pathlib import Path
 import platform
+import os
+import sys
 import time
 
 import numpy as np
@@ -21,6 +24,25 @@ import torch
 from turnpoint import load_conversations, score_turns, train_model, load_model
 from turnpoint.importance import summarise_scores
 from turnpoint.encoder import MODEL_NAME, MODEL_REVISION
+
+# EDIT THESE SETTINGS when opening this script and clicking Run (no arguments).
+# Relative paths start at the repository root, regardless of your IDE's folder.
+DATA = "data/formatted"
+CONVERSATION_OUTCOMES = ["value_created"]
+INDIVIDUAL_OUTCOMES = ["instrumental", "self", "process", "relationship"]
+OUTPUT = "output/hfc_mpnet"  # Must be new or empty.
+SAMPLE_SIZE = 0  # 0 = all conversations; use 30 for a small check.
+CHECKPOINT = None  # Or a model.pt path to score its saved test split without training.
+
+# Training settings apply to both IDE and terminal runs.
+EPOCHS = 10
+SEED = 0
+LEARNING_RATE = 0.001
+DEVICE = "cpu"
+ENCODER_OPTIONS = {}
+MODEL_OPTIONS = {"hidden_dim": 128, "num_layers": 2, "num_heads": 4, "dropout": 0.1}
+OUTCOME_WEIGHTS = {}
+
 
 def json_object(value):
     """Parse a command-line JSON dictionary, with a readable argument error."""
@@ -69,7 +91,7 @@ def run(args):
 
     Whole conversations stay together. Outcome scaling and baselines
     use training data only. Test data never selects epochs. Input tables are
-    loaded into memory; model/training settings are internal defaults.
+    loaded into memory; model/training settings come from the top-of-file settings.
     """
     if args.checkpoint:
         score_checkpoint(args)
@@ -260,19 +282,29 @@ def outcome_definitions(names):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__, epilog="Model and training settings use fixed internal defaults.")
+    parser = argparse.ArgumentParser(description=__doc__, epilog="With no arguments, use the editable settings at the top of this script.")
     parser.add_argument("--data", type=Path, required=True, help="Folder containing your formatted CSVs")
     parser.add_argument("--conversation-outcomes", nargs="+", default=[], metavar="NAME", help="Conversation outcome names (continuous by default)")
     parser.add_argument("--individual-outcomes", nargs="+", default=[], metavar="NAME", help="Individual outcome names (continuous by default)")
     parser.add_argument("--sample-size", type=int, default=0, help="Optional conversation limit (default: all; 0: all)")
     parser.add_argument("--output", type=Path, default=Path("output/run"), help="Results folder (default: output/run; must be new or empty)")
     parser.add_argument("--checkpoint", type=Path, help="Existing model.pt: score its saved test split without training")
-    # Internal settings, not command-line options.
+    # Shared training settings; data/output settings above are used only without arguments.
     parser.set_defaults(
-        epochs=10, seed=0, encoder_options={}, model_options={},
-        outcome_weights={}, learning_rate=0.001, device="cpu",
+        epochs=EPOCHS, seed=SEED, encoder_options=ENCODER_OPTIONS, model_options=MODEL_OPTIONS,
+        outcome_weights=OUTCOME_WEIGHTS, learning_rate=LEARNING_RATE, device=DEVICE,
     )
-    args = parser.parse_args()
+    arguments = sys.argv[1:]
+    if not arguments:
+        os.chdir(Path(__file__).resolve().parent)
+        arguments = ["--data", str(DATA), "--output", str(OUTPUT), "--sample-size", str(SAMPLE_SIZE)]
+        if CONVERSATION_OUTCOMES:
+            arguments += ["--conversation-outcomes", *CONVERSATION_OUTCOMES]
+        if INDIVIDUAL_OUTCOMES:
+            arguments += ["--individual-outcomes", *INDIVIDUAL_OUTCOMES]
+        if CHECKPOINT is not None:
+            arguments += ["--checkpoint", str(CHECKPOINT)]
+    args = parser.parse_args(arguments)
     try:
         args.conversation_outcomes = outcome_definitions(args.conversation_outcomes)
         args.individual_outcomes = outcome_definitions(args.individual_outcomes)

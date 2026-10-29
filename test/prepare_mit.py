@@ -8,11 +8,21 @@ Use --exercise rental for Rental; --conditions optionally selects conditions.
 """
 
 import argparse
+import os
+import sys
 import ast
 from collections import Counter
 from contextlib import ExitStack
 import csv
 from pathlib import Path
+
+# EDIT THESE SETTINGS when opening this script and clicking Run (no arguments).
+# Relative paths start at the repository root. Generated files are replaced.
+SOURCE = "data/MIT AI negotiation competition"
+DESTINATION = "data/formatted"
+EXERCISE = "hfc"  # "hfc" or "rental"
+CONDITIONS = None  # None = all conditions; or e.g. ["round2"]
+
 import re
 
 from openpyxl import load_workbook
@@ -146,5 +156,11 @@ if __name__ == "__main__":
     parser.add_argument("destination", type=Path)
     parser.add_argument("--exercise", choices=["hfc", "rental"], default="hfc", help="MIT exercise (default: hfc)")
     parser.add_argument("--conditions", nargs="+", help="Condition names; default: all supplied conditions")
-    args = parser.parse_args()
+    arguments = sys.argv[1:]
+    if not arguments:
+        os.chdir(Path(__file__).resolve().parents[1])
+        arguments = [str(SOURCE), str(DESTINATION), "--exercise", EXERCISE]
+        if CONDITIONS:
+            arguments += ["--conditions", *CONDITIONS]
+    args = parser.parse_args(arguments)
     prepare_mit(args.source, args.destination, args.conditions, args.exercise)

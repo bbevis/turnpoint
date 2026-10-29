@@ -4,9 +4,11 @@ Run from the repository root: python test/summarise_examples.py
 Missing runs are marked pending; rerun once they finish. No dialogue is exported.
 """
 import json
+import os
 from pathlib import Path
 import pandas as pd
 
+# EDIT THESE SETTINGS to choose the scoring and training folders for each dataset.
 RUNS = {"HFC": ("output/hfc_scored", "output/hfc_mpnet"),
         "Rental": ("output/rental_full", "output/rental_full"),
         "CaSiNo": ("output/casino_full", "output/casino_full")}
@@ -50,4 +52,5 @@ def summarise_examples():
     print(pd.DataFrame(coverage).to_string(index=False),flush=True)
 
 if __name__=='__main__':
+    os.chdir(Path(__file__).resolve().parents[1])
     summarise_examples()

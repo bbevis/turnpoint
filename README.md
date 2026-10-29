@@ -1,20 +1,20 @@
 # TurnPoint
 
-TurnPoint estimates how conversational turns contribute to predictions of negotiation
+TurnPoint estimates how conversational turns contribute to predictions of conversation
 outcomes. It uses a frozen MPNet text encoder and a trainable conversation Transformer
-to predict eventual outcomes after each turn. Turn importance measures how much a
-prediction changes from the preceding turn. These are predictive updates, not causal
-effects or direct measurements of participants’ feelings.
+to predict eventual conversation outcomes after each turn. It then estimates turn importance
+which measures how much a prediction changes from the preceding turn.
 
-This guide reproduces the HFC negotiation analysis using the source data included in
-this repository. Additional instructions below cover the Rental and CaSiNo analyses,
-which train separate models on separate datasets.
+For testing, this guide explains how to reproduce the HFC negotiation analysis.
+It produces prediction conversation outcomes, turn importnace scores, and candidate turning points.
+
+For other datasets (Rental, CaSiNo) and combined result tables see [additional analyses](docs/additional-analyses.md).
 
 ## 1. Clone and install
 
-The recorded replication environment is **Python 3.13 on macOS ARM**. Use Python
-3.13 to follow the pinned environment as closely as possible. Run these commands in
-a terminal:
+Choose the setup block for your system.
+
+**macOS / Linux**
 
 ```bash
 git clone https://github.com/bbevis/turnpoint.git
@@ -25,46 +25,112 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-On Windows PowerShell, replace the environment creation and activation commands with:
+**Windows PowerShell**
 
 ```powershell
+git clone https://github.com/bbevis/turnpoint.git
+cd turnpoint
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-Run all remaining commands from the repository root with the environment active.
-The first analysis run needs internet access to download the pretrained
-`sentence-transformers/all-mpnet-base-v2` encoder. Model downloads and cached
-embeddings are reused on later runs and remain local.
+The pretrained `sentence-transformers/all-mpnet-base-v2` encoder downloads
+automatically on the first analysis run.
+
+For the steps below, choose either your IDE or the terminal. In an IDE, select
+this repository's `.venv` Python interpreter. Each script has an **EDIT THESE SETTINGS**
+block near the top: edit it, save the file, and click Run with no script arguments.
+Paths are resolved from the repository root automatically.
+
+In the terminal, keep `.venv` active and run the commands from the repository root.
+Supplying arguments uses the terminal inputs instead of the script's data/output settings.
 
 ## 2. Prepare the HFC data
 
-The four HFC source workbooks are included in
-`data/MIT AI negotiation competition/outcomes/`; no separate data download is needed.
-Convert them to the CSV inputs used by TurnPoint:
+This example uses AI-generated HFC negotiations from the MIT AI negotiation
+competition. The four source workbooks are included in
+`data/MIT AI negotiation competition/outcomes/`, with dialogue and measured outcomes.
+The example combines four source groups, distinguished by their source and the
+negotiation instructions given to the bots:
+
+| Source group | Meaning in this example |
+| --- | --- |
+| `round2` | Second-round competition conversations using participants’ submitted negotiation instructions |
+| `unprompted` | Conversations involving a bot without an additional negotiation-strategy prompt |
+| `inject_voss_modified` | Conversations involving a bot instructed to question each offer and accept only after the same offer has been repeated five times |
+| `negomate_modified` | Conversations involving a bot instructed to plan in detail, considering goals, priorities, alternatives, the other side’s interests, and trade-offs |
+
+The generated data record these labels in a metadata variable named `condition`.
+It identifies each conversation’s source group; it is not an outcome or a model
+input. The script setting `CONDITIONS` selects which groups to include.
+
+`test/prepare_mit.py` is an independent, dataset-specific preparation script for
+replicating this example; it is not part of the TurnPoint algorithm. Its cleaning
+rules reflect how these source files were constructed.
+
+**For your own analysis, you need to prepare and validate your own data.** This
+script is not a substitute. Create the TurnPoint input files
+(`turns.csv` and the relevant outcome CSVs) from your own sources, choosing cleaning
+rules appropriate to your data, then use `run.py` with your folder and outcome names.
+
+To replicate HFC, convert the included workbooks as follows.
+
+**In an IDE…**
+
+Open `test/prepare_mit.py`. The settings near the top are already set for HFC:
+
+```python
+SOURCE = "data/MIT AI negotiation competition"
+DESTINATION = "data/formatted"
+EXERCISE = "hfc"
+CONDITIONS = None  # Use all four source groups.
+```
+
+Change `SOURCE` or `DESTINATION` if needed, then save and click Run.
+
+**In the terminal…**
 
 ```bash
 python test/prepare_mit.py "data/MIT AI negotiation competition" data/formatted
 ```
 
-This uses all four conditions: `round2`, `unprompted`, `inject_voss_modified`, and
-`negomate_modified`. It removes appended SVI questionnaire responses and tagged
-private preparation/strategy blocks from the model inputs. Unparseable or incomplete
+By default, this combines all four source groups into one dataset. The preparation
+script removes appended SVI questionnaire responses and tagged private
+preparation/strategy blocks from the model inputs. Unparseable or incomplete
 dialogues and conversations without identifiable dialogue from both participants
 are excluded and logged.
 
 The expected result is **40,638 conversations**. The generated folder contains
 `turns.csv`, `conversation_outcomes.csv`, `individual_outcomes.csv`, an exclusion
-log, and `preparation_summary.json`. Preparation prints counts for each workbook;
-rerunning it replaces the generated files.
+log, and `preparation_summary.json`.
 
 ## 3. Run the HFC analysis
+
+**In an IDE…**
+
+Open `run.py`. In **EDIT THESE SETTINGS** near the top, use:
+
+```python
+DATA = "data/formatted"  # Match DESTINATION from preparation.
+CONVERSATION_OUTCOMES = ["value_created"]
+INDIVIDUAL_OUTCOMES = ["instrumental", "self", "process", "relationship"]
+OUTPUT = "output/hfc_mpnet"  # Choose a new or empty folder.
+SAMPLE_SIZE = 0  # Use all conversations.
+CHECKPOINT = None  # Train a new model.
+```
+
+Save and click Run. Training settings, including `EPOCHS`, `SEED`, and
+`LEARNING_RATE`, are directly below this block and apply to both ways of running.
+
+**In the terminal…**
 
 ```bash
 python run.py --data data/formatted --conversation-outcomes value_created --individual-outcomes instrumental self process relationship --output output/hfc_mpnet
 ```
 
-This predicts joint `value_created` and each participant’s four SVI outcomes.
+This predicts joint `value_created` at the dyad level and each participant’s four SVI outcomes at the individual level.
 The runner uses:
 
 - An **80/10/10 split by conversation**: 32,510 training, 4,064 validation, and
@@ -76,18 +142,33 @@ The runner uses:
   Apple MPS when available, otherwise CPU.
 - Final-turn prediction evaluation and turn scoring for **every test conversation**.
 
-For a small execution check first, append
-`--sample-size 30` and replace the output path with `output/hfc_check`. This checks
-that the workflow runs; it does not reproduce the full analysis.
+Optionally, try 30 conversations first.
 
-Always choose a new or empty output directory. Generated data, checkpoints, cached
-embeddings, and results are ignored by Git. Seeds and deterministic PyTorch operations
-support repeat runs in the same environment, but exact numerical agreement across
-platforms, library versions, or devices is not guaranteed.
+**In an IDE…**
+
+In `run.py`, change only these two settings, then save and click Run:
+
+```python
+SAMPLE_SIZE = 30
+OUTPUT = "output/hfc_check"
+```
+
+**In the terminal…**
+
+```bash
+python run.py --data data/formatted --conversation-outcomes value_created --individual-outcomes instrumental self process relationship --sample-size 30 --output output/hfc_check
+```
+
+For the full analysis, restore `SAMPLE_SIZE = 0` and `OUTPUT = "output/hfc_mpnet"`
+in the IDE, or use the full terminal command above.
 
 ## 4. Inspect the results
 
-Results are saved under `output/hfc_mpnet/`:
+Start with `output/hfc_mpnet/metrics.csv`. Compare the `model` and `training_baseline` rows for each
+outcome: lower MAE and RMSE mean smaller prediction errors. Then examine
+`importance_summary.csv` and `candidates.csv` for the turn-level analysis.
+
+The output folder contains:
 
 | File | Purpose |
 | --- | --- |
@@ -111,54 +192,12 @@ exploratory screening rule, not a significance test or proof of a turning point.
 Inspect prediction performance against the baseline before interpreting rankings;
 final-turn performance alone does not validate turn scores.
 
-## 5. Additional datasets and combined summary
+## Common issues
 
-These analyses reuse the same workflow but train separate models. They do not test
-whether an HFC-trained model transfers to another dataset.
-
-### MIT Rental
-
-Rental source workbooks are **not included in the repository**. To reproduce this
-analysis, obtain the four `*_rental_wide_outcomes_deid.xlsx` workbooks and place them
-in `data/MIT AI negotiation competition/outcomes/`. Without these inputs, skip Rental;
-cloning the repository is sufficient for HFC, but not Rental.
-
-```bash
-python test/prepare_mit.py "data/MIT AI negotiation competition" data/rental_formatted --exercise rental
-python run.py --data data/rental_formatted --conversation-outcomes value_created --individual-outcomes instrumental self process relationship --output output/rental_full
-```
-
-The sources used in the original analysis yielded **40,601 conversations** and
-816,736 turns, with 194 conversations excluded for unidentified speakers.
-
-### CaSiNo human negotiations
-
-The preparation script downloads the [CaSiNo dataset](https://github.com/kushalchawla/CaSiNo)
-(Chawla et al., 2021; CC BY 4.0) if it is missing. The source revision is pinned
-and its SHA-256 checksum is verified.
-
-```bash
-python test/prepare_casino.py data/casino_raw/casino.json data/casino_formatted
-python run.py --data data/casino_formatted --conversation-outcomes joint_points --individual-outcomes points_scored satisfaction opponent_likeness --output output/casino_full
-```
-
-Expected coverage is **1,030 conversations** and 11,919 text turns after removing
-interface events. Satisfaction and liking are mapped to ordered 1–5 ratings and
-treated as continuous outcomes. Joint points are the sum of supplied participant
-points, rather than surplus above a disagreement baseline.
-
-### Combine the result tables
-
-The summary script expects HFC scores in `output/hfc_scored/`. Create that folder
-by scoring the saved HFC model, without retraining:
-
-```bash
-python run.py --data data/formatted --checkpoint output/hfc_mpnet/model.pt --output output/hfc_scored
-python test/summarise_examples.py
-```
-
-Checkpoint scoring verifies the formatted input checksums and uses the saved test
-split. The summary script combines HFC, Rental, and CaSiNo results into
-`output/proposal_results/dataset_summary.csv`, `importance_summary.csv`, and
-`prediction_metrics.csv`. Missing dataset runs are marked `pending`; the summary
-can therefore also be generated after completing HFC alone.
+- **Returning in a new terminal:** open the cloned `turnpoint` folder and activate
+  the environment again: `source .venv/bin/activate` on macOS/Linux, or
+  `.\.venv\Scripts\Activate.ps1` in PowerShell. Installation is only needed once.
+- **A script or input file cannot be found:** run commands from the repository root,
+  the folder containing `README.md` and `run.py`.
+- **The output directory is not empty:** change the `--output` path to a new folder,
+  such as `output/hfc_repeat`. The runner protects existing results from being mixed.

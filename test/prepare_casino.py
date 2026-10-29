@@ -5,10 +5,18 @@ Downloads the pinned original JSON if the source path is missing. Source: Chawla
 et al. (2021), https://github.com/kushalchawla/CaSiNo (CC BY 4.0).
 """
 import argparse
+import os
+import sys
 import csv
 import hashlib
 import json
 from pathlib import Path
+
+# EDIT THESE SETTINGS when opening this script and clicking Run (no arguments).
+# Relative paths start at the repository root. Generated files are replaced.
+SOURCE = "data/casino_raw/casino.json"  # Downloaded if missing.
+DESTINATION = "data/casino_formatted"
+
 import urllib.request
 
 REVISION = "2f6ed4a6a55110152a7699fbaa8150d6036314be"
@@ -78,5 +86,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path)
     parser.add_argument('destination', type=Path)
-    args = parser.parse_args()
+    arguments = sys.argv[1:]
+    if not arguments:
+        os.chdir(Path(__file__).resolve().parents[1])
+        arguments = [str(SOURCE), str(DESTINATION)]
+    args = parser.parse_args(arguments)
     prepare_casino(args.source, args.destination)
