@@ -10,6 +10,35 @@ It produces prediction conversation outcomes, turn importnace scores, and candid
 
 For other datasets (Rental, CaSiNo) and combined result tables see [additional analyses](docs/additional-analyses.md).
 
+## Repository overview
+
+```text
+turnpoint/
+├── run.py             # Main analysis script
+├── src/turnpoint/     # TurnPoint package: loading, encoding, modelling, and scoring
+├── test/              # Example data-preparation and result-summary scripts
+├── data/              # Included source workbooks and generated analysis inputs
+├── output/            # Generated models and results (created when you run an analysis)
+└── docs/              # Instructions for additional example analyses
+```
+
+After installation, the key scripts run in this order:
+
+1. **`test/prepare_mit.py`** prepares the supplied HFC workbooks for this replication example; use your own data-processing script for other datasets.
+   Alternatively, **`test/prepare_casino.py`** downloads and prepares the CaSiNo example dataset.
+2. **`run.py`** loads prepared data, trains and evaluates the model, and saves turn scores and candidate turning points.
+3. **`test/summarise_examples.py`** (optional) combines example results into summary tables, following the [additional-analysis instructions](docs/additional-analyses.md#combine-the-result-tables).
+
+**Called automatically by `run.py`** — these modules in `src/turnpoint/` do not need to be run individually:
+
+| Module | Purpose |
+| --- | --- |
+| `loader.py` | Reads and validates the prepared conversation and outcome files. |
+| `encoder.py` | Converts turn text into numerical representations using the frozen pretrained encoder. |
+| `model.py` | Defines the conversation model that predicts outcomes after each turn. |
+| `train.py` | Trains the model, selects the best validation epoch, and handles saved models. |
+| `importance.py` | Calculates prediction changes, turn importance, and candidate summaries. |
+
 ## 1. Clone and install
 
 Choose the setup block for your system.

@@ -16,7 +16,7 @@ from contextlib import ExitStack
 import csv
 from pathlib import Path
 
-# EDIT THESE SETTINGS when opening this script and clicking Run (no arguments).
+# EDIT THESE SETTINGS when opening this script and clicking Run.
 # Relative paths start at the repository root. Generated files are replaced.
 SOURCE = "data/MIT AI negotiation competition"
 DESTINATION = "data/formatted"
@@ -42,10 +42,10 @@ def prepare_mit(source, destination, conditions=None, exercise="hfc"):
 
     Removes appended SVI questionnaire responses and tagged preparation/strategy
     blocks from dialogue. Retains original message positions as turn numbers.
-    Missing outcome cells stay missing; no scores are inferred or recomputed.
+    Missing outcome cells stay missing.
     Unparseable/truncated dialogue, unidentified speakers, and conversations
     without both roles are excluded and logged in excluded_conversations.csv.
-    Source workbooks are streamed and never modified. Output files are replaced.
+    Source workbooks are streamed and never modified. Output files are overwritten.
     """
     source, destination = Path(source), Path(destination)
     files = sorted((source / "outcomes").glob(f"*_{exercise}_wide_outcomes_deid.xlsx"))
